@@ -39,7 +39,7 @@ public class PACEHandler {
     
     
     private static let MRZ_PACE_KEY_REFERENCE : UInt8 = 0x01
-    private static let CAN_PACE_KEY_REFERENCE : UInt8 = 0x02 // Not currently supported
+    private static let CAN_PACE_KEY_REFERENCE : UInt8 = 0x02
     private static let PIN_PACE_KEY_REFERENCE : UInt8 = 0x03 // Not currently supported
     private static let CUK_PACE_KEY_REFERENCE : UInt8 = 0x04 // Not currently supported
 
@@ -72,6 +72,14 @@ public class PACEHandler {
     }
     
     public func doPACE( mrzKey : String ) async throws {
+        try await self.doPACE(key: mrzKey, keyType: PACEHandler.MRZ_PACE_KEY_REFERENCE )
+    }
+    
+    public func doPACE( can : String ) async throws {
+        try await self.doPACE(key: can, keyType: PACEHandler.CAN_PACE_KEY_REFERENCE )
+    }
+    
+    private func doPACE( key : String, keyType : UInt8 ) async throws {
         guard isPACESupported else {
             throw NFCPassportReaderError.NotYetSupported( "PACE not supported" )
         }
@@ -86,9 +94,15 @@ public class PACEHandler {
         cipherAlg  = try paceInfo.getCipherAlgorithm()  // Either DESede or AES.
         digestAlg = try paceInfo.getDigestAlgorithm()  // Either SHA-1 or SHA-256.
         keyLength = try paceInfo.getKeyLength()  // Get key length  the enc cipher. Either 128, 192, or 256.
-
-        paceKeyType = PACEHandler.MRZ_PACE_KEY_REFERENCE
-        paceKey = try createPaceKey( from: mrzKey )
+        
+        paceKeyType = keyType
+        if keyType == PACEHandler.MRZ_PACE_KEY_REFERENCE {
+            paceKey = try createPaceKey( from: key )
+        } else if keyType == PACEHandler.CAN_PACE_KEY_REFERENCE {
+            paceKey = try createPaceKey(can: key)
+        } else {
+            throw NFCPassportReaderError.NotYetSupported( "Unsupported PACE Key Type \(keyType)" )
+        }
         
         // Temporary logging
         Log.verbose("doPace - inpit parameters" )
@@ -99,7 +113,7 @@ public class PACEHandler {
         Log.verbose("cipherAlg - \(cipherAlg)" )
         Log.verbose("digestAlg - \(digestAlg)" )
         Log.verbose("keyLength - \(keyLength)" )
-        Log.verbose("keyLength - \(mrzKey)" )
+        Log.verbose("key - \(key)" )
         Log.verbose("paceKey - \(binToHexRep(paceKey, asArray:true))" )
 
         // First start the initial auth call
@@ -234,8 +248,40 @@ public class PACEHandler {
     }
     
     func doPACEStep2IM( passportNonce: [UInt8] ) async throws -> OpaquePointer {
-        // Not implemented yet
-        throw NFCPassportReaderError.PACEError( "Step2IM", "IM not yet implemented" )
+        Log.debug( "Sending public mapping key to passport..")
+        
+        var pcd = [UInt8](repeating: 0, count: passportNonce.count)
+        guard SecRandomCopyBytes(kSecRandomDefault, passportNonce.count, &pcd) == errSecSuccess else {
+            throw NFCPassportReaderError.PACEError( "Step2IM", "Unable to generate random pcd" )
+        }
+        
+        let step2Data = wrapDO(b:0x81, arr:pcd)
+        _ = try await tagReader.sendGeneralAuthenticate(data:step2Data, isLast:false)
+
+        let ctx = BN_CTX_new()
+        let p = BN_new()
+        let cofactor = BN_new()
+        let curve = EC_GROUP_new_by_curve_name(parameterSpec)
+        defer {
+            BN_CTX_free(ctx)
+            BN_free(p)
+            BN_free(cofactor)
+            EC_GROUP_free(curve)
+        }
+        EC_GROUP_get_curve(curve , p, nil, nil, ctx)
+
+        let rnd = try PACEMapping.pseudoRandomFunction(s: passportNonce, t: pcd, p: p!, algorithm: cipherAlg)
+        
+        // ephmeralParams are free'd in stage 3
+        let ephemeralParams : OpaquePointer
+        if self.agreementAlg == "ECDH" {
+            Log.debug( "Doing ECDH Mapping agreement")
+            ephemeralParams = try PACEMapping.doECDHIntegratedMappingAgreement(t: rnd, curve: curve!)
+        } else {
+            throw NFCPassportReaderError.PACEError( "Step2IM", "Unsupported agreement algorithm" )
+        }
+        
+        return ephemeralParams
     }
     
     /// Generates an ephemeral public/private key pair based on mapping parameters from step 2, and then sends
@@ -587,6 +633,17 @@ extension PACEHandler {
         
         let smskg = SecureMessagingSessionKeyGenerator()
         let key = try smskg.deriveKey(keySeed: hash, cipherAlgName: cipherAlg, keyLength: keyLength, nonce: nil, mode: .PACE_MODE, paceKeyReference: paceKeyType)
+        return key
+    }
+    
+    /// Computes a key seed based on an CAN key
+    /// - Parameter the can key
+    /// - Returns the utf8 encoding of the can key that can be used for PACE
+    func createPaceKey( can canKey: String ) throws -> [UInt8] {
+        let keySeed = [UInt8](canKey.utf8)
+        
+        let smskg = SecureMessagingSessionKeyGenerator()
+        let key = try smskg.deriveKey(keySeed: keySeed, cipherAlgName: cipherAlg, keyLength: keyLength, nonce: nil, mode: .PACE_MODE, paceKeyReference: paceKeyType)
         return key
     }
     
